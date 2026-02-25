@@ -341,4 +341,4 @@ All of these: **start** at client → openim-api; **end** at openim-api returnin
 | Consume ToPushTopic, push to user | `internal/push/push.go`, push handler |
 | Token parsing | `internal/api/router.go` (GinParseToken), `internal/msggateway/ws_server.go` (ParseToken), `internal/rpc/auth` |
 
-Use this with [DEVELOPER.md](../DEVELOPER.md) to follow a request from entry (API or gateway) to RPC, Kafka, storage, and push.
+Use this with [DEVELOPER.md](DEVELOPER.md) to follow a request from entry (API or gateway) to RPC, Kafka, storage, and push.
