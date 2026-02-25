@@ -2,7 +2,7 @@
 
 This guide walks through adding a new RPC microservice to the OpenIM Server codebase. We use **auth-service** as the example (a hypothetical extra auth-related service). The same steps apply to any new service; substitute your service name where you see `auth-service` or `authservice`.
 
-**Prerequisites:** OpenIM Server repo is already cloned. You are familiar with Go, gRPC, and the layout described in [DEVELOPER.md](../DEVELOPER.md) and [PROCESS_FLOW.md](../PROCESS_FLOW.md).
+**Prerequisites:** OpenIM Server repo is already cloned. You are familiar with Go, gRPC, and the layout described in [DEVELOPER.md](../README.md) and [PROCESS_FLOW.md](../PROCESS_FLOW.md).
 
 ---
 
@@ -750,4 +750,4 @@ flowchart LR
 - [ ] Build: `mage build openim-rpc-auth-service` (or equivalent).
 - [ ] Run and test with etcd and openim-api.
 
-For more on the codebase and request flow, see [DEVELOPER.md](../DEVELOPER.md), [PROCESS_FLOW.md](PROCESS_FLOW.md), and [TECHNOLOGY.md](TECHNOLOGY.md).
+For more on the codebase and request flow, see [DEVELOPER.md](../README.md), [PROCESS_FLOW.md](PROCESS_FLOW.md), and [TECHNOLOGY.md](TECHNOLOGY.md).

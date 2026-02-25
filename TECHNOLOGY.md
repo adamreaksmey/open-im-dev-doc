@@ -283,4 +283,4 @@ These are the main algorithms and design patterns used to solve specific problem
 
 ---
 
-For request flow and sequence diagrams, see [PROCESS_FLOW.md](PROCESS_FLOW.md). For development setup and code layout, see [DEVELOPER.md](DEVELOPER.md).
+For request flow and sequence diagrams, see [PROCESS_FLOW.md](PROCESS_FLOW.md). For development setup and code layout, see [DEVELOPER.md](README.md).
