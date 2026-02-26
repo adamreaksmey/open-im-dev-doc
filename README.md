@@ -56,7 +56,7 @@ For **request flow** (where a request starts and ends, with Mermaid and sequence
 
 - **Go:** 1.22.7 or later (see `go.mod`).  
   - [Install Go](https://go.dev/doc/install).
-- **Docker & Docker Compose:** Required for running dependencies (MongoDB, Redis, Kafka, MinIO, etc.) and for full integration tests.
+- **Docker & Docker Compose:** Required to run the **infrastructure** OpenIM depends on: **MongoDB**, **Redis**, **Kafka**, **etcd**, and **MinIO**. OpenIM Server does not run these itself; you must start them (e.g. via the repo’s `docker-compose.yml`) before or alongside the OpenIM binaries. There is **no RabbitMQ**—the message queue is **Kafka** only. See **[INFRASTRUCTURE_AND_DOCKER.md](INFRASTRUCTURE_AND_DOCKER.md)** for what each component is for and how to run them with Docker.
 - **Mage:** Build and run tasks use [Mage](https://github.com/magefile/mage). Install with:
   ```bash
   go install github.com/magefile/mage@latest
