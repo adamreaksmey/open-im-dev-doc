@@ -20,14 +20,16 @@ This document covers the full authentication architecture across **our-business-
 
 ## 1. Token Types
 
-There are five distinct tokens in this system across two servers. They serve different purposes and must not be confused with each other.
+There are four distinct tokens in this system across two servers. They serve different purposes and must not be confused with each other.
 
-| Token | Issued By | Held By | Visible To | Represents |
-|-------|-----------|---------|------------|------------|
-| **DH session token** | our-business-server | End user (client) | End user only | "This user is logged into our system" |
-| **Admin JWT** | our-admin-server (or auth provider) | Admin user (client) | Admin only | "This admin is authenticated" |
-| **OpenIM user token** | open-im-server | our-business-server (Redis, per user) | Never exposed | "This user is authenticated in OpenIM" |
-| **OpenIM admin token** | open-im-server | our-business-server + our-admin-server (memory) | Never exposed | "This server is a trusted backend service" |
+| Token | Format | Issued By | Held By | Visible To | Represents |
+|-------|--------|-----------|---------|------------|------------|
+| **DH session token** | Opaque (random bytes) | our-business-server | End user (client) | End user only | "This user is logged into our system" |
+| **Admin JWT** | JWT (RS256) | our-admin-server | Admin user (client) | Admin only | "This admin is authenticated" |
+| **OpenIM user token** | JWT (OpenIM-signed) | open-im-server | our-business-server (Redis, per user) | Never exposed | "This user is authenticated in OpenIM" |
+| **OpenIM admin token** | JWT (OpenIM-signed) | open-im-server | our-business-server + our-admin-server (memory) | Never exposed | "This server is a trusted backend service" |
+
+> **Important:** Both OpenIM tokens (user and admin) are JWTs — they are issued and signed by open-im-server using its own signing key. The difference between them is not the format but the userID embedded in the claims. The admin token's userID maps to the designated admin user in open-im-server, which grants it elevated privileges on protected routes.
 
 ### 1.1 DH session token (end user)
 
@@ -85,19 +87,40 @@ func (m *AdminAuthMiddleware) Verify(tokenStr string) (*AdminClaims, error) {
 
 ### 1.3 OpenIM user token
 
-- Issued by open-im-server per user, fixed TTL set in open-im-server config
-- Stored in Redis by our-business-server alongside the DH session: `session:{userID}`
+- A JWT issued and signed by open-im-server — not by us
+- Has a fixed TTL set in open-im-server's config (set this long, e.g. 30 days)
+- Stored in Redis by our-business-server alongside the DH session: `session:{tokenHash}`
 - End users never see this token — it is completely internal
 - Used only on outbound gRPC calls from our-business-server → open-im-server
+- **When it expires, it is silently re-issued via `GetUserToken` using the admin token — no user re-login required**
 
 ### 1.4 OpenIM admin token
 
-- Issued by open-im-server using a shared admin secret from config
-- Fetched once at startup by our-business-server and our-admin-server
-- Stored in memory (not Redis — it is process-level)
-- Refreshed in the background before expiry
-- Used for privileged operations: registering users, re-issuing user tokens, admin-level calls
-- This is the "master key" — it can generate a new OpenIM user token for any userID on demand
+- Also a JWT issued and signed by open-im-server — same format as the user token
+- The only difference from a user token is that its userID maps to the designated admin user in open-im-server, which open-im-server uses to grant elevated privileges
+- Acquired at startup by calling open-im-server's `GetAdminToken` RPC with the admin secret configured in open-im-server's config
+- Stored in memory only — never in Redis or DB
+- Refreshed in the background before expiry via the same `GetAdminToken` RPC
+- **Its primary purpose in our system: call `GetUserToken(anyUserID)` to silently re-issue an expired OpenIM user token without any user interaction**
+
+> **There is no refresh token concept on the OpenIM side.** The admin token IS the re-issue mechanism. When a user's OpenIM JWT expires, our-business-server calls `GetUserToken(userID)` using the admin token and gets a brand new JWT back — one RPC call, completely transparent to the user. This is by design.
+
+```go
+// How to acquire the OpenIM admin token at startup
+resp, err := authClient.GetAdminToken(ctx, &authpb.GetAdminTokenReq{
+    Secret:   cfg.OpenIM.AdminSecret, // from our config, matches open-im-server config
+    UserID:   cfg.OpenIM.AdminUserID, // the designated admin userID in open-im-server
+    Platform: 1,
+})
+// Store resp.Token in memory — this is your admin token
+
+// How to re-issue any user's OpenIM token using the admin token
+resp, err := authClient.GetUserToken(ctx, &authpb.GetUserTokenReq{
+    UserID:   targetUserID,
+    Platform: session.Platform,
+})
+// resp.Token is the fresh OpenIM user JWT — store back in Redis
+```
 
 ---
 
@@ -354,25 +377,34 @@ m.redis.Del(ctx, "session:"+userID)
 
 ---
 
-## 7. OpenIM Token Lifecycle & Refresh
+## 7. OpenIM Token Lifecycle & Re-issue
 
-The OpenIM user token has a fixed TTL. Since your session is long-lived and sliding, the OpenIM token will inevitably expire during an active session. This must be handled transparently.
+The OpenIM user token is a JWT with a fixed TTL set in open-im-server's config. Since your user session is long-lived and sliding, the OpenIM token will inevitably expire during an active session. This is handled entirely on the backend — the user never knows it happened.
+
+> **There is no refresh token flow on the OpenIM side.** Do not look for one. The admin token is the re-issue mechanism. When a user's OpenIM JWT expires, our-business-server calls `GetUserToken(userID)` using the admin token and receives a brand new JWT. One RPC call. That's it.
 
 ### 7.1 Strategy
 
-Set OpenIM's token TTL long (e.g. 30 days) in open-im-server config to minimize refresh frequency. But always have a fallback to re-issue silently using the admin token.
+Set OpenIM's token TTL as long as reasonably possible (e.g. 30 days) in open-im-server's config to minimize how often re-issue is needed. But always have the `GetUserToken` call ready as a fallback — it will never fail as long as the admin token is valid and open-im-server is reachable.
 
-### 7.2 Token refresh logic
+### 7.2 How OpenIM's auth works internally (important context)
 
-Before every outbound call to open-im-server on behalf of a user, check if the OpenIM token is still valid. If it is expiring soon or has expired, re-issue using the admin token:
+When our-business-server calls a protected open-im-server route, open-im-server:
+
+1. Extracts the token from gRPC metadata (`token` key)
+2. Validates the JWT signature using its own signing key
+3. Extracts the userID from the claims
+4. Checks if the route requires admin-level access — if yes, verifies the userID is the admin user
+5. Proceeds or rejects
+
+Both user tokens and admin tokens go through the same validation path. The privilege level is determined solely by the userID in the claims.
+
+### 7.3 Token re-issue logic
+
+Before every outbound call to open-im-server on behalf of a user, check if the OpenIM token is expiring soon. If so, call `GetUserToken` using the admin token to get a fresh one:
 
 ```go
-func (c *Client) getValidUserToken(ctx context.Context, userID string) (string, error) {
-    session, err := c.redis.Get(ctx, "session:"+userID)
-    if err != nil {
-        return "", ErrSessionNotFound
-    }
-
+func (c *Client) getValidUserToken(ctx context.Context, userID string, session *Session) (string, error) {
     // Refresh if expiring within 5 minutes
     if time.Until(session.OpenIMTokenExpiry) < 5*time.Minute {
         resp, err := c.authClient.GetUserToken(ctx, &authpb.GetUserTokenReq{
@@ -380,37 +412,44 @@ func (c *Client) getValidUserToken(ctx context.Context, userID string) (string, 
             Platform: session.Platform,
         })
         if err != nil {
+            // open-im-server is down — return transient error, do NOT log user out
             return "", fmt.Errorf("re-issue openim token: %w", err)
         }
         session.OpenIMToken = resp.Token
         session.OpenIMTokenExpiry = time.Now().Add(
             time.Duration(resp.ExpireTimeSeconds) * time.Second,
         )
-        c.redis.Set(ctx, "session:"+userID, session)
+        // Persist the refreshed token back to Redis
+        if err := c.redis.Set(ctx, "session:"+session.TokenHash, session); err != nil {
+            return "", fmt.Errorf("persist refreshed token: %w", err)
+        }
     }
-
     return session.OpenIMToken, nil
 }
 ```
 
-This is called automatically by the client interceptor. Use cases never touch token logic directly.
+This is called automatically before every outbound gRPC call. Use cases never touch token logic directly.
 
-### 7.3 Admin token refresh
+### 7.4 Admin token re-issue
 
-The admin token also has a TTL. Refresh it in the background before expiry:
+The admin token is also a JWT with a TTL. Refresh it in the background before expiry using the same `GetAdminToken` RPC used at startup:
 
 ```go
 func (s *TokenStore) StartRefreshLoop(ctx context.Context) {
     go func() {
         for {
-            timeUntilExpiry := time.Until(s.expiry)
-            refreshIn := timeUntilExpiry - 5*time.Minute
+            refreshIn := time.Until(s.expiry) - 5*time.Minute
             if refreshIn < 0 {
                 refreshIn = 0
             }
             select {
             case <-time.After(refreshIn):
-                s.refresh(ctx)
+                if err := s.refresh(ctx); err != nil {
+                    // Log and alert — this is critical
+                    // Retry immediately rather than waiting
+                    time.Sleep(10 * time.Second)
+                    _ = s.refresh(ctx)
+                }
             case <-ctx.Done():
                 return
             }
@@ -423,17 +462,17 @@ func (s *TokenStore) StartRefreshLoop(ctx context.Context) {
 
 ## 8. Failure & Expiration Cases
 
-### 8.1 Your session token expired (user inactive)
+### 8.1 DH session token expired (user inactive)
 
-The Redis key TTL elapsed — the user was genuinely inactive.
+The Redis key TTL elapsed — the user was genuinely inactive for longer than the session TTL.
 
-**Outcome:** User must log in again. No silent recovery. Return `401 Unauthorized`.
+**Outcome:** User must log in again via DH. No silent recovery. Return `401 Unauthorized`.
 
-### 8.2 OpenIM user token expired, session still alive
+### 8.2 OpenIM user token expired, DH session still alive
 
-The user is active but their OpenIM token TTL elapsed.
+The user is active but their OpenIM JWT TTL elapsed.
 
-**Outcome:** Silently re-issue using admin token (see §7.2). User never notices. Request continues normally.
+**Outcome:** our-business-server silently calls `GetUserToken(userID)` using the admin token. A fresh OpenIM JWT is returned in one RPC call. Stored back in Redis. The original request continues with the new token. The user never knows this happened. There is no refresh token involved — the admin token is the re-issue mechanism.
 
 ### 8.3 OpenIM user token expired AND re-issue fails
 
@@ -469,15 +508,15 @@ if status.Code(err) == codes.NotFound {
 
 ### Summary table
 
-| Case | Your Session | OpenIM Token | Outcome |
-|------|-------------|--------------|---------|
+| Case | DH Session | OpenIM Token | Outcome |
+|------|------------|--------------|---------|
 | Both valid | ✅ | ✅ | Request proceeds normally |
-| Session valid, OpenIM expired | ✅ | ❌ | Silent re-issue via admin token |
-| Session valid, re-issue fails | ✅ | ❌ | 503, retry next request |
-| Session expired | ❌ | any | 401, user must re-login |
-| Admin token expired | ✅ | ❌ | Immediate sync refresh of admin token |
-| open-im-server unreachable | ✅ | any | 503, session preserved |
-| User missing in open-im-server | ✅ | ❌ | Self-heal: re-register + re-issue |
+| Session valid, OpenIM expired | ✅ | ❌ | Silent re-issue via `GetUserToken` (admin token) |
+| Session valid, re-issue fails | ✅ | ❌ | 503, retry next request, session preserved |
+| DH session expired | ❌ | any | 401, user must re-login via DH |
+| Admin token expired | ✅ | ❌ | Immediate sync refresh via `GetAdminToken` |
+| open-im-server unreachable | ✅ | any | 503, session preserved in Redis |
+| User missing in open-im-server | ✅ | ❌ | Self-heal: re-register + `GetUserToken` |
 
 ---
 
